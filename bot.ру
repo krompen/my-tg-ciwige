@@ -1,4 +1,17 @@
-import sqlite3
+async def admin_create_promo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ Нет прав.")
+        return
+    if len(context.args) < 4:
+        await update.message.reply_text("❌ /promo_create <код> <1/2/3/4/5> <дни> <макс_использований>")
+        return
+    code = context.args[0].upper()
+    level = int(context.args[1])
+    days = int(context.args[2])
+    max_uses = int(context.args[3])
+    create_promocode(code, level, days, max_uses)
+    await update.message.reply_text(f"✅ Промокод {code} создан!")
+    log_action(ADMIN_ID, f"Создал промокод {code}")import sqlite3
 import random
 import datetime
 import asyncio
@@ -1177,7 +1190,20 @@ async def admin_promo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Пример: /promo_create SUMMER 3 7 100",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="admin")]])
     )
-
+async def admin_create_promo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ Нет прав.")
+        return
+    if len(context.args) < 4:
+        await update.message.reply_text("❌ /promo_create <код> <1/2/3/4/5> <дни> <макс_использований>")
+        return
+    code = context.args[0].upper()
+    level = int(context.args[1])
+    days = int(context.args[2])
+    max_uses = int(context.args[3])
+    create_promocode(code, level, days, max_uses)
+    await update.message.reply_text(f"✅ Промокод {code} создан!")
+    log_action(ADMIN_ID, f"Создал промокод {code}")
 async def admin_add_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if query.from_user.id != ADMIN_ID:
