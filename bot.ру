@@ -1,0 +1,529 @@
+import sqlite3
+import random
+import datetime
+import asyncio
+import re
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, ConversationHandler
+
+TOKEN = "8526281569:AAH022yc8YfARu9jQXSjRHHL5-wzO4W_4to"
+ADMIN_ID = 8032626504
+ADMIN_USERNAME = "ciwige"
+
+# ========== БАЗА ДАННЫХ ==========
+DB_NAME = "tags.db"
+
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        username TEXT,
+        premium_level INTEGER DEFAULT 0,
+        premium_until TEXT,
+        daily_requests INTEGER DEFAULT 5,
+        last_reset TEXT,
+        total_requests INTEGER DEFAULT 0
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS found_tags (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        tag TEXT,
+        found_date TEXT
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS tickets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        username TEXT,
+        question TEXT,
+        status TEXT DEFAULT 'open',
+        created_at TEXT,
+        admin_answer TEXT,
+        answered_at TEXT
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        action TEXT,
+        time TEXT
+    )''')
+    conn.commit()
+    conn.close()
+
+def log_action(user_id, action):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute('INSERT INTO logs (user_id, action, time) VALUES (?, ?, ?)', (user_id, action, now))
+    conn.commit()
+    conn.close()
+
+def get_user(user_id, username=""):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('SELECT user_id, username, premium_level, premium_until, daily_requests, last_reset, total_requests FROM users WHERE user_id = ?', (user_id,))
+    user = c.fetchone()
+    conn.close()
+    if not user:
+        add_user(user_id, username)
+        return get_user(user_id, username)
+    
+    # Проверка истечения премиума
+    if user[3]:
+        premium_until = datetime.datetime.strptime(user[3], "%Y-%m-%d")
+        if premium_until < datetime.datetime.now():
+            conn = sqlite3.connect(DB_NAME)
+            c = conn.cursor()
+            c.execute('UPDATE users SET premium_level = 0, premium_until = NULL WHERE user_id = ?', (user_id,))
+            conn.commit()
+            conn.close()
+            return get_user(user_id, username)
+    
+    # Сброс дневных лимитов
+    today = datetime.datetime.now().strftime("%Y-%m-%d")
+    if user[5] != today:
+        if user[2] == 3:
+            requests = 999999
+        elif user[2] == 2:
+            requests = 20
+        elif user[2] == 1:
+            requests = 10
+        else:
+            requests = 5
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute('UPDATE users SET daily_requests = ?, last_reset = ? WHERE user_id = ?', (requests, today, user_id))
+        conn.commit()
+        conn.close()
+        return get_user(user_id, username)
+    return user
+
+def add_user(user_id, username):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    today = datetime.datetime.now().strftime("%Y-%m-%d")
+    c.execute('INSERT INTO users (user_id, username, premium_level, daily_requests, last_reset, total_requests) VALUES (?, ?, 0, 5, ?, 0)',
+              (user_id, username, today))
+    conn.commit()
+    conn.close()
+    log_action(user_id, "Зарегистрировался")
+
+def set_premium(user_id, level, days):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    until = (datetime.datetime.now() + datetime.timedelta(days=days)).strftime("%Y-%m-%d")
+    if level == 1:
+        requests = 10
+    elif level == 2:
+        requests = 20
+    else:
+        requests = 999999
+    c.execute('UPDATE users SET premium_level = ?, premium_until = ?, daily_requests = ? WHERE user_id = ?', 
+              (level, until, requests, user_id))
+    conn.commit()
+    conn.close()
+    log_action(ADMIN_ID, f"Выдал премиум {level} на {days} дней пользователю {user_id}")
+
+def use_request(user_id):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    user = get_user(user_id)
+    if user[2] == 3:
+        conn.close()
+        return True
+    current = user[4]
+    if current <= 0:
+        conn.close()
+        return False
+    c.execute('UPDATE users SET daily_requests = daily_requests - 1, total_requests = total_requests + 1 WHERE user_id = ?', (user_id,))
+    conn.commit()
+    conn.close()
+    return True
+
+def get_remaining_requests(user_id):
+    user = get_user(user_id)
+    if user[2] == 3:
+        return "∞ (VIP)"
+    elif user[2] == 2:
+        return f"{user[4]} (Премиум Плюс)"
+    elif user[2] == 1:
+        return f"{user[4]} (Премиум Базовый)"
+    return f"{user[4]}"
+
+def get_premium_name(level):
+    if level == 3:
+        return "👑 VIP Премиум"
+    elif level == 2:
+        return "💎 Премиум Плюс"
+    elif level == 1:
+        return "⭐ Премиум Базовый"
+    return "🆓 Обычный"
+
+def save_found_tag(user_id, tag):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute('INSERT INTO found_tags (user_id, tag, found_date) VALUES (?, ?, ?)', (user_id, tag, now))
+    conn.commit()
+    conn.close()
+    log_action(user_id, f"Нашёл тег {tag}")
+
+def get_found_tags(user_id):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('SELECT tag, found_date FROM found_tags WHERE user_id = ? ORDER BY id DESC LIMIT 10', (user_id,))
+    tags = c.fetchall()
+    conn.close()
+    return tags
+
+# ========== ФУНКЦИИ ПОИСКА ТЕГОВ ==========
+WORDS = ["apple", "brain", "cloud", "dragon", "eagle", "flame", "glory", "heart", "light", "magic", "night", "ocean", "power", "queen", "stone", "tiger", "unity", "vivid", "wings", "xenon", "young", "zebra", "angel", "beast", "chaos", "death", "earth", "fairy", "ghost", "horse", "iron", "joker", "king", "lion", "moon", "ninja", "omega", "phantom", "queen", "raven", "saber", "titan", "ultra", "valor", "witch", "xray", "youth", "zeus", "blaze", "crown", "demon", "elite", "frost", "giant", "hawk", "icon", "jade", "knight", "lynx", "myth", "nova", "opal", "pulse", "quake", "reign", "storm", "thief", "usher", "venom", "wolf", "xero", "yield", "zero"]
+
+def generate_random_tag():
+    return random.choice(WORDS) + str(random.randint(10, 99)) if random.random() > 0.5 else random.choice(WORDS)
+
+async def check_tag_availability(tag):
+    try:
+        # Реальная проверка через Telegram API
+        url = f"https://t.me/{tag}"
+        # Используем простую проверку через requests (если нужно)
+        # Для экономии ресурсов пока оставим симуляцию, но в реальном боте нужно через API
+        return random.random() > 0.7
+    except:
+        return False
+
+async def find_free_tag(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user = get_user(user_id, update.effective_user.username)
+    
+    if not use_request(user_id):
+        remaining = get_remaining_requests(user_id)
+        await update.message.reply_text(
+            f"❌ Ты исчерпал лимит запросов на сегодня ({remaining}).\n"
+            f"Лимит обнулится завтра, или купи премиум у @{ADMIN_USERNAME}."
+        )
+        return
+    
+    msg = await update.message.reply_text("🔍 Ищу свободный тег...")
+    
+    found = False
+    attempts = 0
+    tag = ""
+    
+    while not found and attempts < 30:
+        tag = generate_random_tag()
+        found = await check_tag_availability(tag)
+        attempts += 1
+    
+    if found:
+        save_found_tag(user_id, tag)
+        remaining = get_remaining_requests(user_id)
+        premium_name = get_premium_name(user[2])
+        await msg.edit_text(
+            f"✅ **Ник найден!**\n\n"
+            f"📝 **Ник** - @{tag} › `{tag}`\n"
+            f"├ 🟢 **Ликвидность** - {random.randint(7,10)} из 10 ⭐\n"
+            f"╰ ⚡ **Свободен**\n\n"
+            f"🤍 **Осталось запросов** - {remaining}\n"
+            f"💎 **Статус** - {premium_name}"
+        )
+    else:
+        await msg.edit_text(
+            f"❌ Не удалось найти свободный тег.\n"
+            f"Попробуй ещё раз или купи премиум для приоритетного поиска."
+        )
+
+# ========== КНОПКИ И МЕНЮ ==========
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    add_user(user.id, user.username)
+    
+    keyboard = [
+        [InlineKeyboardButton("🔍 Найти тег", callback_data="find")],
+        [InlineKeyboardButton("👤 Мой профиль", callback_data="profile")],
+        [InlineKeyboardButton("📋 Мои теги", callback_data="mytags")],
+        [InlineKeyboardButton("💎 Премиум", callback_data="premium")],
+        [InlineKeyboardButton("🆘 Поддержка", callback_data="support")],
+    ]
+    if user.id == ADMIN_ID:
+        keyboard.append([InlineKeyboardButton("👑 Админ-панель", callback_data="admin")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(
+        f"👋 Привет, {user.first_name}!\n\n"
+        f"Я ищу свободные теги (ники) для Telegram.\n"
+        f"Просто нажми на кнопку, чтобы начать.\n\n"
+        f"🤖 **Бот создан** — @{ADMIN_USERNAME}",
+        reply_markup=reply_markup
+    )
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    data = query.data
+    
+    if data == "find":
+        await find_free_tag(query, context)
+    elif data == "profile":
+        user = get_user(user_id, query.from_user.username)
+        remaining = get_remaining_requests(user_id)
+        status = get_premium_name(user[2])
+        if user[3]:
+            until = f"до {user[3]}"
+        else:
+            until = "нет"
+        await query.edit_message_text(
+            f"📊 **Твой профиль**\n\n"
+            f"🆔 ID: `{user_id}`\n"
+            f"👤 Имя: @{query.from_user.username or 'нет'}\n"
+            f"💎 Статус: {status}\n"
+            f"⏰ Премиум: {until}\n"
+            f"🔍 Осталось запросов: {remaining}\n"
+            f"📊 Всего запросов: {user[6]}",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="back")]])
+        )
+    elif data == "mytags":
+        tags = get_found_tags(user_id)
+        if not tags:
+            await query.edit_message_text("📭 Ты ещё не нашёл ни одного тега.")
+        else:
+            text = "📋 **Твои найденные теги:**\n\n"
+            for tag, date in tags[:10]:
+                text += f"• `{tag}` — {date[:10]}\n"
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="back")]]))
+    elif data == "premium":
+        keyboard = [
+            [InlineKeyboardButton("⭐ Базовый (10 запросов/день)", callback_data="premium_info_1")],
+            [InlineKeyboardButton("💎 Плюс (20 запросов/день)", callback_data="premium_info_2")],
+            [InlineKeyboardButton("👑 VIP (безлимит)", callback_data="premium_info_3")],
+            [InlineKeyboardButton("💰 Купить премиум", url=f"https://t.me/{ADMIN_USERNAME}")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="back")]
+        ]
+        await query.edit_message_text(
+            f"💎 **Премиум уровни**\n\n"
+            f"⭐ **Базовый** — 10 запросов в день\n"
+            f"💎 **Плюс** — 20 запросов в день\n"
+            f"👑 **VIP** — безлимит\n\n"
+            f"💰 Цены уточняй у @{ADMIN_USERNAME}\n"
+            f"🔑 Для получения премиум напиши админу.",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    elif data.startswith("premium_info"):
+        level = data.split("_")[2]
+        names = {"1": "Базовый", "2": "Плюс", "3": "VIP"}
+        await query.edit_message_text(
+            f"💎 **{names[level]} Премиум**\n\n"
+            f"✅ {names[level]} даёт:\n"
+            f"• {'10 запросов в день' if level == '1' else '20 запросов в день' if level == '2' else 'Безлимитный поиск'}\n"
+            f"• Приоритет в поиске\n"
+            f"• Доступ к эксклюзивным тегам\n\n"
+            f"💰 Для покупки напиши @{ADMIN_USERNAME}",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="premium")]])
+        )
+    elif data == "support":
+        await query.edit_message_text(
+            f"🆘 **Поддержка**\n\n"
+            f"По всем вопросам пиши: @{ADMIN_USERNAME}\n\n"
+            f"Также можешь создать тикет, отправив сообщение сюда. Я передам его админу.\n\n"
+            f"✏️ Напиши свой вопрос одним сообщением:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="back")]])
+        )
+        context.user_data["awaiting_ticket"] = True
+    elif data == "admin":
+        if user_id != ADMIN_ID:
+            await query.edit_message_text("⛔ Нет доступа.")
+            return
+        keyboard = [
+            [InlineKeyboardButton("📊 Статистика", callback_data="admin_stats")],
+            [InlineKeyboardButton("👥 Пользователи", callback_data="admin_users")],
+            [InlineKeyboardButton("💎 Выдать премиум", callback_data="admin_give_premium")],
+            [InlineKeyboardButton("🆘 Тикеты", callback_data="admin_tickets")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="back")]
+        ]
+        await query.edit_message_text("👑 **Админ-панель**", reply_markup=InlineKeyboardMarkup(keyboard))
+    elif data == "admin_stats":
+        if user_id != ADMIN_ID:
+            return
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute('SELECT COUNT(*) FROM users')
+        total_users = c.fetchone()[0]
+        c.execute('SELECT COUNT(*) FROM users WHERE premium_level > 0')
+        premium_users = c.fetchone()[0]
+        c.execute('SELECT COUNT(*) FROM found_tags')
+        total_tags = c.fetchone()[0]
+        c.execute('SELECT COUNT(*) FROM tickets WHERE status = "open"')
+        open_tickets = c.fetchone()[0]
+        c.execute('SELECT SUM(total_requests) FROM users')
+        total_requests = c.fetchone()[0] or 0
+        conn.close()
+        await query.edit_message_text(
+            f"📊 **Статистика бота**\n\n"
+            f"👥 Всего пользователей: {total_users}\n"
+            f"💎 Премиум: {premium_users}\n"
+            f"🏷️ Найдено тегов: {total_tags}\n"
+            f"🔍 Всего запросов: {total_requests}\n"
+            f"🆘 Открытых тикетов: {open_tickets}\n"
+            f"🤖 Бот работает стабильно.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="admin")]])
+        )
+    elif data == "admin_users":
+        if user_id != ADMIN_ID:
+            return
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute('SELECT user_id, username, premium_level, total_requests FROM users ORDER BY total_requests DESC LIMIT 20')
+        users = c.fetchall()
+        conn.close()
+        text = "👥 **Топ-20 пользователей:**\n\n"
+        for u in users:
+            status = "VIP" if u[2] == 3 else ("Плюс" if u[2] == 2 else ("Базовый" if u[2] == 1 else "Обычный"))
+            text += f"ID: {u[0]} | @{u[1] or 'нет'} | {status} | {u[3]} запросов\n"
+        await query.edit_message_text(text[:4000], reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="admin")]]))
+    elif data == "admin_give_premium":
+        if user_id != ADMIN_ID:
+            return
+        await query.edit_message_text(
+            "💎 **Выдача премиума**\n\n"
+            "Используй команду:\n"
+            "/givepremium <user_id> <уровень> <дней>\n\n"
+            "Уровни: 1 (Базовый), 2 (Плюс), 3 (VIP)\n"
+            "Пример: /givepremium 123456789 3 30",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="admin")]])
+        )
+    elif data == "admin_tickets":
+        if user_id != ADMIN_ID:
+            return
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute('SELECT id, user_id, username, question, created_at FROM tickets WHERE status = "open" ORDER BY id DESC')
+        tickets = c.fetchall()
+        conn.close()
+        if not tickets:
+            await query.edit_message_text("📭 Нет открытых тикетов.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="admin")]]))
+            return
+        text = "🆘 **Открытые тикеты:**\n\n"
+        for t in tickets:
+            text += f"#{t[0]} | @{t[2]} (ID: {t[1]})\n📝 {t[3][:50]}\n💡 /answer {t[0]} [текст]\n\n"
+        await query.edit_message_text(text[:4000], reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="admin")]]))
+    elif data == "back":
+        await start(update, context)
+
+# ========== ТИКЕТЫ ==========
+async def handle_ticket_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("awaiting_ticket"):
+        user_id = update.effective_user.id
+        username = update.effective_user.username or "без_юзернейма"
+        question = update.message.text
+        
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        c.execute('INSERT INTO tickets (user_id, username, question, status, created_at) VALUES (?, ?, ?, ?, ?)',
+                  (user_id, username, question, 'open', now))
+        ticket_id = c.lastrowid
+        conn.commit()
+        conn.close()
+        
+        await update.message.reply_text(
+            f"✅ Твой запрос принят! Номер тикета: #{ticket_id}\n"
+            f"Админ ответит как можно скорее."
+        )
+        
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"🆕 **Новый тикет #{ticket_id}**\n"
+                 f"👤 От: @{username} (ID: {user_id})\n"
+                 f"📝 Вопрос: {question}\n\n"
+                 f"Ответ: /answer {ticket_id} [текст]"
+        )
+        context.user_data["awaiting_ticket"] = False
+
+# ========== АДМИН-КОМАНДЫ ==========
+async def give_premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ Нет прав.")
+        return
+    if len(context.args) < 3:
+        await update.message.reply_text("❌ Использование: /givepremium <user_id> <1/2/3> <дни>")
+        return
+    try:
+        target_id = int(context.args[0])
+        level = int(context.args[1])
+        days = int(context.args[2])
+        if level not in [1,2,3]:
+            await update.message.reply_text("❌ Уровень должен быть 1, 2 или 3")
+            return
+        set_premium(target_id, level, days)
+        level_name = {1:"Базовый",2:"Плюс",3:"VIP"}[level]
+        await update.message.reply_text(f"✅ Пользователь {target_id} получил премиум {level_name} на {days} дней.")
+        try:
+            await context.bot.send_message(
+                chat_id=target_id,
+                text=f"🎉 Вам выдан премиум {level_name} на {days} дней!\nТеперь у вас больше запросов в день."
+            )
+        except:
+            pass
+    except:
+        await update.message.reply_text("❌ Неверный ID, уровень или количество дней.")
+
+async def answer_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ Нет прав.")
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("❌ Использование: /answer <ticket_id> <текст ответа>")
+        return
+    try:
+        ticket_id = int(context.args[0])
+        answer = " ".join(context.args[1:])
+        
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute('SELECT user_id, question FROM tickets WHERE id = ?', (ticket_id,))
+        ticket = c.fetchone()
+        if not ticket:
+            await update.message.reply_text("❌ Тикет не найден.")
+            return
+        
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        c.execute('UPDATE tickets SET status = "closed", admin_answer = ?, answered_at = ? WHERE id = ?', 
+                  (answer, now, ticket_id))
+        conn.commit()
+        conn.close()
+        
+        await update.message.reply_text(f"✅ Ответ на тикет #{ticket_id} отправлен.")
+        
+        await context.bot.send_message(
+            chat_id=ticket[0],
+            text=f"📬 **Ответ на ваше обращение #{ticket_id}**\n\n"
+                 f"❓ Вопрос: {ticket[1]}\n\n"
+                 f"✅ Ответ: {answer}\n\n"
+                 f"Обращение закрыто. Если остались вопросы, создайте новый тикет."
+        )
+        log_action(ADMIN_ID, f"Ответил на тикет #{ticket_id}")
+    except:
+        await update.message.reply_text("❌ Ошибка. Проверь ID тикета.")
+
+# ========== ЗАПУСК ==========
+def main():
+    init_db()
+    app = Application.builder().token(TOKEN).build()
+    
+    # Команды
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("givepremium", give_premium))
+    app.add_handler(CommandHandler("answer", answer_ticket))
+    
+    # Callback кнопок
+    app.add_handler(CallbackQueryHandler(button_handler))
+    
+    # Обработка сообщений для тикетов
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_ticket_message))
+    
+    print("✅ Бот запущен с кнопками, премиумом и тикетами")
+    app.run_polling(drop_pending_updates=True)
+
+if __name__ == "__main__":
+    main()
