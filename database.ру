@@ -1,0 +1,55 @@
+import sqlite3
+from datetime import datetime, date
+from typing import Optional, List, Dict, Any
+
+DB_PATH = "bot_data.db"
+
+
+def get_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    with get_conn() as conn:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id      INTEGER PRIMARY KEY,
+                username     TEXT    DEFAULT '',
+                first_name   TEXT    DEFAULT '',
+                is_banned    INTEGER DEFAULT 0,
+                premium_until TEXT   DEFAULT NULL,
+                total_searches INTEGER DEFAULT 0,
+                last_search_length INTEGER DEFAULT 5,
+                created_at   TEXT    DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS daily_searches (
+                user_id  INTEGER NOT NULL,
+                search_date TEXT NOT NULL,
+                count    INTEGER DEFAULT 0,
+                PRIMARY KEY (user_id, search_date)
+            );
+
+            CREATE TABLE IF NOT EXISTS tickets (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    INTEGER NOT NULL,
+                message    TEXT    NOT NULL,
+                status     TEXT    DEFAULT 'open',
+                created_at TEXT    DEFAULT (datetime('now')),
+                closed_at  TEXT    DEFAULT NULL
+            );
+        """)
+
+
+# ─── Users ─────────────────────────────────────────────────────────────────────
+
+def add_user(user_id: int, username: str, first_name: str):
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO users (user_id, username, first_name)
+            VALUES (?, ?, ?)
+            """,
+            (user_id, username, first_name),

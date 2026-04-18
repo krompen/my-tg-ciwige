@@ -1,0 +1,80 @@
+import asyncio
+import random
+import string
+from typing import Optional, Tuple
+
+import aiohttp
+
+import config
+
+TELEGRAM_URL = "https://t.me/{}"
+FRAGMENT_URL = "https://fragment.com/username/{}"
+
+
+async def check_username_available(session: aiohttp.ClientSession, username: str) -> bool:
+    """
+    Checks if a Telegram username is available via Fragment.
+    Returns True if available, False if taken or invalid.
+    """
+    try:
+        url = FRAGMENT_URL.format(username)
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            text = await resp.text()
+            if "Telegram username" in text and ("available" in text.lower() or "not found" in text.lower()):
+                return True
+            if "taken" in text.lower() or "reserved" in text.lower():
+                return False
+            # Fallback: if the page shows it's a valid TG page for this user, it's taken
+            if f"@{username}" in text and "username" in text.lower():
+                return False
+            return True
+    except Exception:
+        return False
+
+
+def generate_username(length: int) -> str:
+    """
+    Generates a random valid Telegram username of given length.
+    Rules: starts with a letter, contains only a-z, 0-9, underscore.
+    """
+    first_char = random.choice(string.ascii_lowercase)
+    chars = string.ascii_lowercase + string.digits + "_"
+
+    rest_length = length - 1
+    rest = ""
+    prev = first_char
+    for _ in range(rest_length):
+        if prev == "_":
+            char = random.choice(string.ascii_lowercase + string.digits)
+        else:
+            char = random.choice(chars)
+        rest += char
+        prev = char
+
+    username = first_char + rest
+    if username.endswith("_"):
+        username = username[:-1] + random.choice(string.ascii_lowercase + string.digits)
+    return username
+
+
+async def find_free_username(
+    length: int,
+    max_attempts: int = None,
+) -> Tuple[Optional[str], int]:
+    """
+    Tries to find a free username of given length.
+    Returns (username, attempts) or (None, attempts).
+    """
+    if max_attempts is None:
+        max_attempts = config.MAX_CHECK_ATTEMPTS
+
+    connector = aiohttp.TCPConnector(ssl=False)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        for attempt in range(1, max_attempts + 1):
+            username = generate_username(length)
+            available = await check_username_available(session, username)
+            if available:
+                return username, attempt
+            await asyncio.sleep(0.1)
+
+    return None, max_attempts

@@ -1,0 +1,81 @@
+import asyncio
+import logging
+import random
+import string
+import sqlite3
+import time
+from datetime import datetime, timedelta
+from typing import Optional
+
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.enums import ParseMode
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    BotCommand,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardRemove,
+)
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+import config
+import database as db
+import username_checker as checker
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+bot = Bot(token=config.BOT_TOKEN, parse_mode=ParseMode.HTML)
+dp = Dispatcher(storage=MemoryStorage())
+router = Router()
+dp.include_router(router)
+
+
+# ─── FSM States ───────────────────────────────────────────────────────────────
+
+class SupportStates(StatesGroup):
+    waiting_message = State()
+    admin_reply = State()
+
+
+class BroadcastStates(StatesGroup):
+    waiting_message = State()
+
+
+class GivePremiumStates(StatesGroup):
+    waiting_user_id = State()
+    waiting_days = State()
+
+
+class SearchStates(StatesGroup):
+    choosing_length = State()
+    choosing_pattern = State()
+
+
+# ─── Keyboards ─────────────────────────────────────────────────────────────────
+
+def main_keyboard(is_premium: bool = False, is_admin: bool = False):
+    rows = [
+        [KeyboardButton(text="🔍 Найти юзернейм"), KeyboardButton(text="⭐ Мой профиль")],
+        [KeyboardButton(text="💎 Премиум"), KeyboardButton(text="🎲 Случайный юзернейм")],
+        [KeyboardButton(text="📩 Поддержка")],
+    ]
+    if is_admin:
+        rows.append([KeyboardButton(text="⚙️ Админ панель")])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+
+def premium_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="💎 Купить Премиум (30 дней)", callback_data="buy_premium"))
+    builder.row(InlineKeyboardButton(text="📋 Что даёт Премиум?", callback_data="premium_info"))
